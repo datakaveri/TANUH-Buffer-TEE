@@ -21,10 +21,6 @@ import (
 )
 
 const (
-	ModelFileName         = "model.onnx"
-	WeightsFileName       = "model.onnx.data"
-	PreprocessingFileName = "preprocessing.py"
-
 	StatusPendingUpload = "pending_upload"
 	StatusQueued        = "queued"
 	StatusDispatched    = "dispatched"
@@ -43,18 +39,17 @@ type Delivery struct {
 type Job struct {
 	JobID              string         `json:"job_id"`
 	Status             string         `json:"status"`
-	DatasetID          int            `json:"dataset_id"`
+	DatasetID          string         `json:"dataset_id"`
 	SubmittedAtUnix    int64          `json:"submitted_at_unix"`
 	UpdatedAtUnix      int64          `json:"updated_at_unix"`
 	Hyperparameters    map[string]any `json:"hyperparameters"`
-	ModelFile          string         `json:"model_file"`
-	WeightsFile        string         `json:"weights_file"`
-	ArtifactDir        string         `json:"artifact_dir"`
+	ModelFormat        string         `json:"model_format"` // onnx | torchscript | huggingface
+	ArtifactDir        string         `json:"artifact_dir"` // one file per upload slot (see artifacts.go)
 	SubmittedBy        string         `json:"submitted_by"`
 	KeycloakToken      string         `json:"keycloak_token"`
 	ModelSHA256        string         `json:"model_sha256_expected"`
 	WeightsSHA256      string         `json:"weights_sha256_expected"`
-	PreprocessingSHA   string         `json:"preprocessing_sha256_expected"`
+	AdaptorSHA         string         `json:"adaptor_sha256_expected"`
 	Notes              string         `json:"notes"`
 	GPUAttempts        int            `json:"gpu_provision_attempts,omitempty"`
 	ProvisioningTarget string         `json:"provisioning_target,omitempty"`
@@ -91,9 +86,11 @@ func Open(root string) (*Store, error) {
 	return s, nil
 }
 
-func (s *Store) jobsDir() string             { return filepath.Join(s.root, "jobs") }
-func (s *Store) queuePath() string           { return filepath.Join(s.root, "queue.json") }
-func (s *Store) dispatchStatePath() string   { return filepath.Join(s.root, "runtime", "dispatch_state.json") }
+func (s *Store) jobsDir() string   { return filepath.Join(s.root, "jobs") }
+func (s *Store) queuePath() string { return filepath.Join(s.root, "queue.json") }
+func (s *Store) dispatchStatePath() string {
+	return filepath.Join(s.root, "runtime", "dispatch_state.json")
+}
 func (s *Store) jobDir(jobID string) string  { return filepath.Join(s.jobsDir(), jobID) }
 func (s *Store) jobPath(jobID string) string { return filepath.Join(s.jobDir(jobID), "job.json") }
 
@@ -112,21 +109,19 @@ func (s *Store) ResultsPath(jobID string) string {
 
 // NewJobRequest carries the validated fields from /v1/submit.
 type NewJobRequest struct {
-	DatasetID        int
-	ModelSHA256      string
-	WeightsSHA256    string
-	PreprocessingSHA string
-	SubmittedBy      string
-	KeycloakToken    string
-	Hyperparameters  map[string]any
-	Notes            string
+	DatasetID       string
+	ModelFormat     string
+	ModelSHA256     string
+	WeightsSHA256   string
+	AdaptorSHA      string
+	SubmittedBy     string
+	KeycloakToken   string
+	Hyperparameters map[string]any
+	Notes           string
 }
 
 // Create makes a new pending_upload job record.
 func (s *Store) Create(req NewJobRequest) (*Job, error) {
-	if req.DatasetID < 1 || req.DatasetID > 3 {
-		return nil, fmt.Errorf("dataset_id must be 1, 2, or 3")
-	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -145,21 +140,20 @@ func (s *Store) Create(req NewJobRequest) (*Job, error) {
 		hp = map[string]any{}
 	}
 	job := &Job{
-		JobID:            jobID,
-		Status:           StatusPendingUpload,
-		DatasetID:        req.DatasetID,
-		SubmittedAtUnix:  now,
-		UpdatedAtUnix:    now,
-		Hyperparameters:  hp,
-		ModelFile:        ModelFileName,
-		WeightsFile:      WeightsFileName,
-		ArtifactDir:      filepath.Join(dir, "artifacts"),
-		SubmittedBy:      orDefault(req.SubmittedBy, "unknown"),
-		KeycloakToken:    req.KeycloakToken,
-		ModelSHA256:      req.ModelSHA256,
-		WeightsSHA256:    req.WeightsSHA256,
-		PreprocessingSHA: req.PreprocessingSHA,
-		Notes:            req.Notes,
+		JobID:           jobID,
+		Status:          StatusPendingUpload,
+		DatasetID:       req.DatasetID,
+		SubmittedAtUnix: now,
+		UpdatedAtUnix:   now,
+		Hyperparameters: hp,
+		ModelFormat:     req.ModelFormat,
+		ArtifactDir:     filepath.Join(dir, "artifacts"),
+		SubmittedBy:     orDefault(req.SubmittedBy, "unknown"),
+		KeycloakToken:   req.KeycloakToken,
+		ModelSHA256:     strings.ToLower(req.ModelSHA256),
+		WeightsSHA256:   strings.ToLower(req.WeightsSHA256),
+		AdaptorSHA:      strings.ToLower(req.AdaptorSHA),
+		Notes:           req.Notes,
 	}
 	if err := s.saveLocked(job); err != nil {
 		return nil, err
@@ -167,12 +161,14 @@ func (s *Store) Create(req NewJobRequest) (*Job, error) {
 	return job, nil
 }
 
-// ReceiveArtifact stores an uploaded artifact, verifies its SHA-256
-// commitment (fail closed), and queues the job once all required files are
+// ReceiveArtifact stores an uploaded artifact for one slot, verifies it
+// against the SHA-256 committed at submit (fail closed: a slot with no
+// commitment accepts nothing), and queues the job once every expected slot is
 // present. Returns the updated job.
-func (s *Store) ReceiveArtifact(jobID, name string, data []byte) (*Job, error) {
-	if name != ModelFileName && name != WeightsFileName && name != PreprocessingFileName {
-		return nil, fmt.Errorf("unknown artifact name: %s", name)
+func (s *Store) ReceiveArtifact(jobID, slot string, data []byte) (*Job, error) {
+	spec, ok := ArtifactBySlot(slot)
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrUnknownSlot, slot)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -184,30 +180,35 @@ func (s *Store) ReceiveArtifact(jobID, name string, data []byte) (*Job, error) {
 	if job.Status != StatusPendingUpload {
 		return nil, fmt.Errorf("job %s is not awaiting upload (status=%s)", jobID, job.Status)
 	}
-
-	expected := map[string]string{
-		ModelFileName:         job.ModelSHA256,
-		WeightsFileName:       job.WeightsSHA256,
-		PreprocessingFileName: job.PreprocessingSHA,
-	}[name]
+	if !spec.AllowedFor(job.ModelFormat) {
+		return nil, fmt.Errorf("%w: %s for %s", ErrSlotNotAllowed, slot, job.ModelFormat)
+	}
+	expected := spec.Commitment(job)
+	if expected == "" {
+		return nil, fmt.Errorf("no SHA-256 was committed for %s at submit", slot)
+	}
+	if int64(len(data)) > spec.MaxBytes {
+		return nil, fmt.Errorf("%s is %d bytes, over the %d-byte limit", slot, len(data), spec.MaxBytes)
+	}
 	sum := sha256.Sum256(data)
-	if expected != "" && hex.EncodeToString(sum[:]) != strings.ToLower(expected) {
-		return nil, fmt.Errorf("SHA256 mismatch for %s", name)
+	if hex.EncodeToString(sum[:]) != expected {
+		return nil, fmt.Errorf("SHA256 mismatch for %s", slot)
 	}
 
 	if err := os.MkdirAll(job.ArtifactDir, 0o755); err != nil {
 		return nil, err
 	}
-	if err := os.WriteFile(filepath.Join(job.ArtifactDir, name), data, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(job.ArtifactDir, slot), data, 0o644); err != nil {
 		return nil, err
 	}
 	job.UpdatedAtUnix = time.Now().Unix()
 
-	// Queue once model + weights are present — plus preprocessing.py when the
-	// submit committed to a preprocessing hash.
-	required := s.artifactExistsLocked(job, ModelFileName) && s.artifactExistsLocked(job, WeightsFileName)
-	if required && job.PreprocessingSHA != "" {
-		required = s.artifactExistsLocked(job, PreprocessingFileName)
+	required := true
+	for _, a := range Artifacts() {
+		if a.Expected(job) && !s.artifactExistsLocked(job, a.Slot) {
+			required = false
+			break
+		}
 	}
 	if required {
 		job.Status = StatusQueued
@@ -226,10 +227,10 @@ func (s *Store) artifactExistsLocked(job *Job, name string) bool {
 	return err == nil
 }
 
-// ArtifactBytes returns a stored artifact's contents.
-func (s *Store) ArtifactBytes(jobID, name string) ([]byte, error) {
-	if name != ModelFileName && name != WeightsFileName && name != PreprocessingFileName {
-		return nil, fmt.Errorf("unknown artifact: %s", name)
+// ArtifactBytes returns a stored artifact's contents by slot.
+func (s *Store) ArtifactBytes(jobID, slot string) ([]byte, error) {
+	if _, ok := ArtifactBySlot(slot); !ok {
+		return nil, fmt.Errorf("%w: %s", ErrUnknownSlot, slot)
 	}
 	s.mu.Lock()
 	job, err := s.getLocked(jobID)
@@ -237,7 +238,7 @@ func (s *Store) ArtifactBytes(jobID, name string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return os.ReadFile(filepath.Join(job.ArtifactDir, name))
+	return os.ReadFile(filepath.Join(job.ArtifactDir, slot))
 }
 
 // Get returns one job.

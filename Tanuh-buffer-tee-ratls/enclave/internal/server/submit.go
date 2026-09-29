@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -27,13 +28,50 @@ const (
 )
 
 // JobRequest is the small HPKE-encrypted metadata payload.
-// Model bytes are NOT included — they are uploaded separately via /v1/upload.
-// SHA256 hashes commit to the files before they arrive (prevents in-transit swaps).
+// Model bytes are NOT included — they are uploaded separately via
+// PUT /v1/upload/{job_id}/{slot}. SHA256 hashes commit to the files before
+// they arrive (prevents in-transit swaps); an upload is accepted only if it
+// matches its committed hash.
 type JobRequest struct {
-	DatasetID           int    `json:"dataset_id"`               // 1, 2, or 3
-	ModelSHA256         string `json:"model_sha256"`             // hex SHA256 of model.onnx plaintext
-	WeightsSHA256       string `json:"weights_sha256"`           // hex SHA256 of weights plaintext
-	PreprocessingSHA256 string `json:"preprocessing_sha256,omitempty"` // hex SHA256 of preprocessing.py (dataset_id=2)
+	DatasetID     string `json:"dataset_id"`               // catalogue dataset UUID (passed through)
+	ModelFormat   string `json:"model_format"`             // onnx | torchscript | huggingface
+	ModelSHA256   string `json:"model_sha256"`             // .onnx / TorchScript .pt / Hugging Face .zip
+	WeightsSHA256 string `json:"weights_sha256,omitempty"` // ONNX external weights (.onnx.data), optional
+	AdaptorSHA256 string `json:"adaptor_sha256"`           // adaptor.py
+}
+
+// validate checks the commitments against the model format so a job that can
+// never be dispatched is refused at submit rather than failing later.
+func (r *JobRequest) validate() error {
+	if !jobs.ValidFormat(r.ModelFormat) {
+		return fmt.Errorf("model_format must be one of onnx, torchscript, huggingface (got %q)", r.ModelFormat)
+	}
+	r.ModelSHA256 = strings.ToLower(strings.TrimSpace(r.ModelSHA256))
+	r.WeightsSHA256 = strings.ToLower(strings.TrimSpace(r.WeightsSHA256))
+	r.AdaptorSHA256 = strings.ToLower(strings.TrimSpace(r.AdaptorSHA256))
+	if !isSHA256Hex(r.ModelSHA256) {
+		return fmt.Errorf("model_sha256 must be a 64-character hex SHA-256")
+	}
+	if !isSHA256Hex(r.AdaptorSHA256) {
+		return fmt.Errorf("adaptor_sha256 must be a 64-character hex SHA-256")
+	}
+	if r.WeightsSHA256 != "" {
+		if r.ModelFormat != jobs.FormatONNX {
+			return fmt.Errorf("weights_sha256 is only used with model_format onnx")
+		}
+		if !isSHA256Hex(r.WeightsSHA256) {
+			return fmt.Errorf("weights_sha256 must be a 64-character hex SHA-256")
+		}
+	}
+	return nil
+}
+
+func isSHA256Hex(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(s)
+	return err == nil
 }
 
 // extractKeycloakSub decodes the JWT payload (already validated by middleware)
@@ -59,9 +97,9 @@ func extractKeycloakSub(tokenStr string) string {
 // ChunkedUploadHeader is Frame 0 of the AES-256-GCM-CHUNKED-v1 stream.
 type ChunkedUploadHeader struct {
 	FileID          string `json:"file_id"`
-	Enc             string `json:"enc"`              // base64std HPKE encapsulated key (32 bytes)
-	WrappedKey      string `json:"wrapped_key"`      // base64std HPKE-wrapped AES-256 key (48 bytes)
-	BaseIV          string `json:"base_iv"`          // base64std 12-byte base IV; chunk i uses BaseIV+i (96-bit big-endian)
+	Enc             string `json:"enc"`         // base64std HPKE encapsulated key (32 bytes)
+	WrappedKey      string `json:"wrapped_key"` // base64std HPKE-wrapped AES-256 key (48 bytes)
+	BaseIV          string `json:"base_iv"`     // base64std 12-byte base IV; chunk i uses BaseIV+i (96-bit big-endian)
 	TotalChunks     int    `json:"total_chunks"`
 	PlaintextSHA256 string `json:"plaintext_sha256"` // hex SHA256 of assembled plaintext
 }
@@ -140,37 +178,28 @@ func (s *Server) HandleSubmit(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// HandleUploadModel serves PUT /v1/upload/{job_id}/model.
-// Decrypts AES-256-GCM-CHUNKED-v1 stream, verifies SHA-256, stores the artifact.
-func (s *Server) HandleUploadModel(w http.ResponseWriter, r *http.Request) {
-	s.handleUpload(w, r, jobs.ModelFileName)
-}
-
-// HandleUploadWeights serves PUT /v1/upload/{job_id}/weights.
-func (s *Server) HandleUploadWeights(w http.ResponseWriter, r *http.Request) {
-	s.handleUpload(w, r, jobs.WeightsFileName)
-}
-
-// HandleUploadPreprocessing serves PUT /v1/upload/{job_id}/preprocessing.
-func (s *Server) HandleUploadPreprocessing(w http.ResponseWriter, r *http.Request) {
-	s.handleUpload(w, r, jobs.PreprocessingFileName)
-}
-
-// handleUpload decrypts a chunked upload and hands the plaintext to the job
-// store, which re-verifies the submit-time SHA-256 commitment and queues the
-// job once all required artifacts are present.
-func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request, artifact string) {
-	jobID := r.PathValue("job_id")
+// HandleUpload serves PUT /v1/upload/{job_id}/{slot} for every upload slot
+// (model, weights, adaptor — see jobs.Artifacts). It decrypts the
+// AES-256-GCM-CHUNKED-v1 stream and hands the plaintext to the job store,
+// which verifies the submit-time SHA-256 commitment and queues the job once
+// every expected slot is present.
+func (s *Server) HandleUpload(w http.ResponseWriter, r *http.Request) {
+	jobID, slot := r.PathValue("job_id"), r.PathValue("slot")
+	if _, ok := jobs.ArtifactBySlot(slot); !ok {
+		writeJSON(w, http.StatusNotFound, map[string]any{"status": "error", "message": "unknown upload slot: " + slot})
+		return
+	}
 	plaintext, err := s.decryptChunkedUpload(r.Body, r.Header.Get("X-RATLS-Browser-HPKE"))
 	if err != nil {
-		log.Printf("%s upload decrypt %s: %v", artifact, jobID, err)
+		log.Printf("%s upload decrypt %s: %v", slot, jobID, err)
 		http.Error(w, "decryption failed: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	job, err := s.store.ReceiveArtifact(jobID, artifact, plaintext)
+	job, err := s.store.ReceiveArtifact(jobID, slot, plaintext)
 	if err != nil {
 		code := http.StatusBadRequest
-		if strings.Contains(err.Error(), "unknown job_id") {
+		if strings.Contains(err.Error(), "unknown job_id") ||
+			errors.Is(err, jobs.ErrUnknownSlot) || errors.Is(err, jobs.ErrSlotNotAllowed) {
 			code = http.StatusNotFound
 		}
 		writeJSON(w, code, map[string]any{"status": "error", "message": err.Error()})
@@ -321,19 +350,23 @@ func (s *Server) processJob(plaintext []byte, keycloakSub string, keycloakToken 
 	if err := json.Unmarshal(plaintext, &jobReq); err != nil {
 		return jsonErr("invalid job payload: " + err.Error())
 	}
+	if err := jobReq.validate(); err != nil {
+		return jsonErr(err.Error())
+	}
 
 	job, err := s.store.Create(jobs.NewJobRequest{
-		DatasetID:        jobReq.DatasetID,
-		ModelSHA256:      jobReq.ModelSHA256,
-		WeightsSHA256:    jobReq.WeightsSHA256,
-		PreprocessingSHA: jobReq.PreprocessingSHA256,
-		SubmittedBy:      keycloakSub,
-		KeycloakToken:    keycloakToken,
+		DatasetID:     jobReq.DatasetID,
+		ModelFormat:   jobReq.ModelFormat,
+		ModelSHA256:   jobReq.ModelSHA256,
+		WeightsSHA256: jobReq.WeightsSHA256,
+		AdaptorSHA:    jobReq.AdaptorSHA256,
+		SubmittedBy:   keycloakSub,
+		KeycloakToken: keycloakToken,
 	})
 	if err != nil {
 		return jsonErr(err.Error())
 	}
-	log.Printf("submit: job %s created (dataset %d)", job.JobID, job.DatasetID)
+	log.Printf("submit: job %s created (dataset %s, format %s)", job.JobID, job.DatasetID, job.ModelFormat)
 
 	respBody, _ := json.Marshal(map[string]any{
 		"status":     job.Status, // "pending_upload"

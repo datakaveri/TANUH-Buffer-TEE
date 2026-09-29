@@ -121,13 +121,28 @@ func (s *Scheduler) dispatchNext(ctx context.Context) {
 		return
 	}
 
-	log.Printf("scheduler: dispatch cycle: job %s (dataset %d)", job.JobID, job.DatasetID)
+	log.Printf("scheduler: dispatch cycle: job %s (dataset %s)", job.JobID, job.DatasetID)
 	s.Store.UpdateDispatchState(map[string]any{
 		"last_dispatch_attempt_unix": time.Now().Unix(),
 		"last_dispatch_job_id":       job.JobID,
 		"last_dispatch_status":       "checking_vm_health",
 		"last_dispatch_error":        "",
 	})
+
+	// Build the payload before provisioning: a job whose artifacts are missing
+	// or no longer match their submit-time hashes can never run, so fail it
+	// instead of starting a VM and retrying it every tick.
+	payload, err := s.buildPayload(job)
+	if err != nil {
+		log.Printf("scheduler: build payload for %s: %v — failing job", job.JobID, err)
+		if _, ferr := s.Store.Fail(job.JobID, "buffer_dispatch", map[string]any{
+			"error_type":    "ArtifactIntegrityError",
+			"error_message": err.Error(),
+		}); ferr != nil {
+			log.Printf("scheduler: fail job %s: %v", job.JobID, ferr)
+		}
+		return
+	}
 
 	res, err := s.Engine.Provision(ctx, job)
 	if err != nil {
@@ -136,12 +151,6 @@ func (s *Scheduler) dispatchNext(ctx context.Context) {
 	}
 	if res == nil {
 		log.Printf("scheduler: job %s: no Processing TEE available this cycle — leaving queued", job.JobID)
-		return
-	}
-
-	payload, err := s.buildPayload(job)
-	if err != nil {
-		log.Printf("scheduler: build payload for %s: %v", job.JobID, err)
 		return
 	}
 	payloadPath := s.Store.OutgoingPayloadPath(job.JobID)
@@ -175,40 +184,47 @@ func (s *Scheduler) dispatchNext(ctx context.Context) {
 	log.Printf("scheduler: job %s dispatched successfully via RA-TLS (%s)", job.JobID, res.Target.Name)
 }
 
-// buildPayload assembles the secure dispatch payload — the same JSON shape
-// the Python manager produced, plus buffer_job_url pointing at this server's
-// :8443 completion endpoint.
-func (s *Scheduler) buildPayload(job *jobs.Job) ([]byte, error) {
-	modelBytes, err := s.Store.ArtifactBytes(job.JobID, jobs.ModelFileName)
-	if err != nil {
-		return nil, fmt.Errorf("read model: %w", err)
-	}
-	weightsBytes, err := s.Store.ArtifactBytes(job.JobID, jobs.WeightsFileName)
-	if err != nil {
-		return nil, fmt.Errorf("read weights: %w", err)
-	}
-	modelSum := sha256.Sum256(modelBytes)
-	weightsSum := sha256.Sum256(weightsBytes)
+// PayloadVersion identifies the Buffer → Processing TEE payload layout. The
+// Processing TEE refuses any other version, so both sides must ship together.
+const PayloadVersion = 2
 
-	payload := map[string]any{
-		"job_id":               job.JobID,
-		"dataset_id":           job.DatasetID,
-		"submitted_at_unix":    job.SubmittedAtUnix,
-		"submitted_by":         job.SubmittedBy,
-		"keycloak_token":       job.KeycloakToken,
-		"hyperparameters":      job.Hyperparameters,
-		"model_file":           jobs.ModelFileName,
-		"weights_file":         jobs.WeightsFileName,
-		"model_sha256":         hex.EncodeToString(modelSum[:]),
-		"weights_sha256":       hex.EncodeToString(weightsSum[:]),
-		"model_onnx_base64":    base64.StdEncoding.EncodeToString(modelBytes),
-		"model_weights_base64": base64.StdEncoding.EncodeToString(weightsBytes),
-		"buffer_job_url":       s.Cfg.CallbackBase + "/v1/jobs/" + job.JobID,
+// buildPayload assembles the secure dispatch payload (version 2):
+//
+//	{"payload_version": 2, "job_id", "dataset_id", "model_format",
+//	 "submitted_at_unix", "submitted_by", "keycloak_token", "buffer_job_url",
+//	 "artifacts": {"<slot>": {"sha256": "<hex>", "base64": "<bytes>"}}}
+//
+// Every artifact the job expects is re-hashed and must still equal the
+// SHA-256 committed at submit.
+func (s *Scheduler) buildPayload(job *jobs.Job) ([]byte, error) {
+	artifacts := map[string]any{}
+	for _, a := range jobs.Artifacts() {
+		if !a.Expected(job) {
+			continue
+		}
+		data, err := s.Store.ArtifactBytes(job.JobID, a.Slot)
+		if err != nil {
+			return nil, fmt.Errorf("read %s: %w", a.Slot, err)
+		}
+		sum := sha256.Sum256(data)
+		got := hex.EncodeToString(sum[:])
+		if got != a.Commitment(job) {
+			return nil, fmt.Errorf("%s does not match its submit-time SHA-256", a.Slot)
+		}
+		artifacts[a.Slot] = map[string]string{
+			"sha256": got,
+			"base64": base64.StdEncoding.EncodeToString(data),
+		}
 	}
-	if ppBytes, err := s.Store.ArtifactBytes(job.JobID, jobs.PreprocessingFileName); err == nil {
-		ppSum := sha256.Sum256(ppBytes)
-		payload["preprocessing_script_base64"] = base64.StdEncoding.EncodeToString(ppBytes)
-		payload["preprocessing_sha256"] = hex.EncodeToString(ppSum[:])
-	}
-	return json.Marshal(payload)
+	return json.Marshal(map[string]any{
+		"payload_version":   PayloadVersion,
+		"job_id":            job.JobID,
+		"dataset_id":        job.DatasetID,
+		"model_format":      job.ModelFormat,
+		"submitted_at_unix": job.SubmittedAtUnix,
+		"submitted_by":      job.SubmittedBy,
+		"keycloak_token":    job.KeycloakToken,
+		"buffer_job_url":    s.Cfg.CallbackBase + "/v1/jobs/" + job.JobID,
+		"artifacts":         artifacts,
+	})
 }

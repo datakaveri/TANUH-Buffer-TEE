@@ -26,10 +26,9 @@ func New(b *bundle.Builder, auth AuthConfig, store *jobs.Store, cfg config.Confi
 	s := &Server{builder: b, store: store, cfg: cfg, mux: http.NewServeMux(), auth: auth}
 	s.mux.HandleFunc("GET /v1/attest", s.HandleAttest)
 	s.mux.HandleFunc("POST /v1/submit", s.HandleSubmit)
-	// Binary file upload — large files sent over TLS, hashes committed via HPKE
-	s.mux.HandleFunc("PUT /v1/upload/{job_id}/model", s.HandleUploadModel)
-	s.mux.HandleFunc("PUT /v1/upload/{job_id}/weights", s.HandleUploadWeights)
-	s.mux.HandleFunc("PUT /v1/upload/{job_id}/preprocessing", s.HandleUploadPreprocessing)
+	// Binary file upload — large files sent over TLS, hashes committed via HPKE.
+	// {slot} is model | weights | adaptor (jobs.Artifacts); anything else is 404.
+	s.mux.HandleFunc("PUT /v1/upload/{job_id}/{slot}", s.HandleUpload)
 	s.mux.HandleFunc("GET /v1/status/{job_id}", s.HandleStatus)
 	s.mux.Handle("GET /v1/queue", requireRole("org_admin", http.HandlerFunc(s.HandleQueue)))
 	s.mux.HandleFunc("GET /v1/results/{job_id}", s.HandleResults)
