@@ -24,6 +24,10 @@ const (
 	SlotModel   = "model"   // .onnx / TorchScript .pt / Hugging Face .zip
 	SlotWeights = "weights" // ONNX external weights (.onnx.data), optional
 	SlotAdaptor = "adaptor" // adaptor.py: raw model outputs -> predictions.csv
+	// SlotInputSpec is input_spec.json: the model's input size / resize for
+	// ONNX and TorchScript (TorchScript files do not record their input size).
+	// Optional.
+	SlotInputSpec = "input_spec"
 )
 
 var (
@@ -65,6 +69,12 @@ var artifactSpecs = []ArtifactSpec{
 		MaxBytes:       1 << 20,
 		allowed:        func(string) bool { return true },
 		commitment:     func(j *Job) string { return j.AdaptorSHA },
+	},
+	{
+		Slot:       SlotInputSpec,
+		MaxBytes:   64 << 10,
+		allowed:    func(f string) bool { return f == FormatONNX || f == FormatTorchScript },
+		commitment: func(j *Job) string { return j.InputSpecSHA },
 	},
 }
 

@@ -24,6 +24,10 @@ func TestJobRequestValidate(t *testing.T) {
 		{"non-hex model hash", JobRequest{ModelFormat: "onnx", ModelSHA256: strings.Repeat("zz", 32), AdaptorSHA256: hex64}, "model_sha256"},
 		{"weights on torchscript", JobRequest{ModelFormat: "torchscript", ModelSHA256: hex64, WeightsSHA256: hex64, AdaptorSHA256: hex64}, "only used with model_format onnx"},
 		{"malformed weights hash", JobRequest{ModelFormat: "onnx", ModelSHA256: hex64, WeightsSHA256: "x", AdaptorSHA256: hex64}, "weights_sha256"},
+		{"torchscript with input spec", JobRequest{ModelFormat: "torchscript", ModelSHA256: hex64, AdaptorSHA256: hex64, InputSpecSHA256: hex64}, ""},
+		{"onnx with input spec", JobRequest{ModelFormat: "onnx", ModelSHA256: hex64, AdaptorSHA256: hex64, InputSpecSHA256: hex64}, ""},
+		{"input spec on huggingface", JobRequest{ModelFormat: "huggingface", ModelSHA256: hex64, AdaptorSHA256: hex64, InputSpecSHA256: hex64}, "only used with onnx and torchscript"},
+		{"malformed input spec hash", JobRequest{ModelFormat: "onnx", ModelSHA256: hex64, AdaptorSHA256: hex64, InputSpecSHA256: "x"}, "input_spec_sha256"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -50,6 +50,7 @@ type Job struct {
 	ModelSHA256        string         `json:"model_sha256_expected"`
 	WeightsSHA256      string         `json:"weights_sha256_expected"`
 	AdaptorSHA         string         `json:"adaptor_sha256_expected"`
+	InputSpecSHA       string         `json:"input_spec_sha256_expected,omitempty"`
 	Notes              string         `json:"notes"`
 	GPUAttempts        int            `json:"gpu_provision_attempts,omitempty"`
 	ProvisioningTarget string         `json:"provisioning_target,omitempty"`
@@ -114,6 +115,7 @@ type NewJobRequest struct {
 	ModelSHA256     string
 	WeightsSHA256   string
 	AdaptorSHA      string
+	InputSpecSHA    string
 	SubmittedBy     string
 	KeycloakToken   string
 	Hyperparameters map[string]any
@@ -153,6 +155,7 @@ func (s *Store) Create(req NewJobRequest) (*Job, error) {
 		ModelSHA256:     strings.ToLower(req.ModelSHA256),
 		WeightsSHA256:   strings.ToLower(req.WeightsSHA256),
 		AdaptorSHA:      strings.ToLower(req.AdaptorSHA),
+		InputSpecSHA:    strings.ToLower(req.InputSpecSHA),
 		Notes:           req.Notes,
 	}
 	if err := s.saveLocked(job); err != nil {

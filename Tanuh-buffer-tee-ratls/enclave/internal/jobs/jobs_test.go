@@ -96,6 +96,39 @@ func TestWeightsSlotNotAllowedForTorchScriptOrHF(t *testing.T) {
 	}
 }
 
+func TestInputSpecSlot(t *testing.T) {
+	spec := []byte(`{"input_size": [224, 224]}`)
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := s.Create(NewJobRequest{ModelFormat: FormatTorchScript, ModelSHA256: sha(modelBytes),
+		AdaptorSHA: sha(adaptorBytes), InputSpecSHA: sha(spec)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustReceive(t, s, job.JobID, SlotModel, modelBytes)
+	if got := mustReceive(t, s, job.JobID, SlotAdaptor, adaptorBytes).Status; got != StatusPendingUpload {
+		t.Fatalf("after model + adaptor: %s (input spec was committed, so still pending)", got)
+	}
+	if got := mustReceive(t, s, job.JobID, SlotInputSpec, spec).Status; got != StatusQueued {
+		t.Fatalf("after input spec: %s", got)
+	}
+	if got, _ := s.ArtifactBytes(job.JobID, SlotInputSpec); !bytes.Equal(got, spec) {
+		t.Fatalf("stored input spec %q", got)
+	}
+
+	// Not committed: refused; with Hugging Face: not a slot of that format.
+	s2, plain := newJob(t, FormatTorchScript, false)
+	if _, err := s2.ReceiveArtifact(plain.JobID, SlotInputSpec, spec); err == nil {
+		t.Fatal("uncommitted input spec accepted")
+	}
+	s3, hf := newJob(t, FormatHuggingFace, false)
+	if _, err := s3.ReceiveArtifact(hf.JobID, SlotInputSpec, spec); !errors.Is(err, ErrSlotNotAllowed) {
+		t.Fatalf("input spec on Hugging Face err=%v, want ErrSlotNotAllowed", err)
+	}
+}
+
 func TestUnknownSlotRejected(t *testing.T) {
 	s, job := newJob(t, FormatONNX, false)
 	for _, slot := range []string{"preprocessing", "model.onnx", "../job.json", ""} {

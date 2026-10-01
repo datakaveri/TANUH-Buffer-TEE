@@ -38,6 +38,9 @@ func queuedJob(t *testing.T, format string, files map[string][]byte) (*Scheduler
 	if w, ok := files[jobs.SlotWeights]; ok {
 		req.WeightsSHA256 = sha(w)
 	}
+	if spec, ok := files[jobs.SlotInputSpec]; ok {
+		req.InputSpecSHA = sha(spec)
+	}
 	job, err := store.Create(req)
 	if err != nil {
 		t.Fatal(err)
@@ -113,6 +116,24 @@ func TestBuildPayloadOnlyCarriesTheFormatsArtifacts(t *testing.T) {
 	arts := decode(t, raw)["artifacts"].(map[string]any)
 	if len(arts) != 2 || arts[jobs.SlotWeights] != nil {
 		t.Fatalf("artifacts = %v", arts)
+	}
+}
+
+func TestBuildPayloadCarriesTheInputSpec(t *testing.T) {
+	spec := []byte(`{"input_size": [256, 256], "resize": "bicubic"}`)
+	s, job := queuedJob(t, jobs.FormatTorchScript, map[string][]byte{
+		jobs.SlotModel:     []byte("model.pt"),
+		jobs.SlotAdaptor:   []byte("adaptor.py"),
+		jobs.SlotInputSpec: spec,
+	})
+	raw, err := s.buildPayload(job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := decode(t, raw)["artifacts"].(map[string]any)[jobs.SlotInputSpec].(map[string]any)
+	got, _ := base64.StdEncoding.DecodeString(a["base64"].(string))
+	if string(got) != string(spec) || a["sha256"] != sha(spec) {
+		t.Fatalf("input_spec artifact %v", a)
 	}
 }
 

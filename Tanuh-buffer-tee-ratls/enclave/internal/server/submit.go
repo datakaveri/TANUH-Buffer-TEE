@@ -38,6 +38,9 @@ type JobRequest struct {
 	ModelSHA256   string `json:"model_sha256"`             // .onnx / TorchScript .pt / Hugging Face .zip
 	WeightsSHA256 string `json:"weights_sha256,omitempty"` // ONNX external weights (.onnx.data), optional
 	AdaptorSHA256 string `json:"adaptor_sha256"`           // adaptor.py
+	// InputSpecSHA256 commits to an optional input_spec.json (ONNX /
+	// TorchScript input size and resize method).
+	InputSpecSHA256 string `json:"input_spec_sha256,omitempty"`
 }
 
 // validate checks the commitments against the model format so a job that can
@@ -61,6 +64,16 @@ func (r *JobRequest) validate() error {
 		}
 		if !isSHA256Hex(r.WeightsSHA256) {
 			return fmt.Errorf("weights_sha256 must be a 64-character hex SHA-256")
+		}
+	}
+	r.InputSpecSHA256 = strings.ToLower(strings.TrimSpace(r.InputSpecSHA256))
+	if r.InputSpecSHA256 != "" {
+		if r.ModelFormat == jobs.FormatHuggingFace {
+			return fmt.Errorf("input_spec_sha256 is only used with onnx and torchscript " +
+				"(Hugging Face models use their preprocessor_config.json)")
+		}
+		if !isSHA256Hex(r.InputSpecSHA256) {
+			return fmt.Errorf("input_spec_sha256 must be a 64-character hex SHA-256")
 		}
 	}
 	return nil
@@ -360,6 +373,7 @@ func (s *Server) processJob(plaintext []byte, keycloakSub string, keycloakToken 
 		ModelSHA256:   jobReq.ModelSHA256,
 		WeightsSHA256: jobReq.WeightsSHA256,
 		AdaptorSHA:    jobReq.AdaptorSHA256,
+		InputSpecSHA:  jobReq.InputSpecSHA256,
 		SubmittedBy:   keycloakSub,
 		KeycloakToken: keycloakToken,
 	})
