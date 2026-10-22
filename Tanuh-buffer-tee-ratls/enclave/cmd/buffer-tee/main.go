@@ -102,9 +102,13 @@ func main() {
 			Certificates: []tls.Certificate{tlsCert},
 			MinVersion:   tls.VersionTLS13, // TLS 1.3 only
 		},
-		ReadTimeout:  600 * time.Second,
-		WriteTimeout: 600 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		// Uploads (PUT /v1/upload) replace these with an idle deadline that
+		// moves while bytes keep arriving, so a large model is not cut off at
+		// 10 minutes; every other endpoint keeps them.
+		ReadHeaderTimeout: 30 * time.Second,
+		ReadTimeout:       600 * time.Second,
+		WriteTimeout:      600 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	go func() {

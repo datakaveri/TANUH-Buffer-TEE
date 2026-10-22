@@ -1,11 +1,8 @@
 package server
 
 import (
-	"crypto/aes"
-	"crypto/cipher"
-	cryptosha256 "crypto/sha256"
+	"bufio"
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -13,19 +10,18 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/datakaveri/tanuh-buffer-tee/internal/bundle"
+	"github.com/datakaveri/tanuh-buffer-tee/internal/chunked"
 	hpkepkg "github.com/datakaveri/tanuh-buffer-tee/internal/hpke"
 	"github.com/datakaveri/tanuh-buffer-tee/internal/jobs"
 )
 
-const (
-	maxHeaderBytes = 8192
-	maxTotalChunks = 16384
-	aesKeyLen      = 32
-)
+const aesKeyLen = 32
 
 // JobRequest is the small HPKE-encrypted metadata payload.
 // Model bytes are NOT included — they are uploaded separately via
@@ -107,16 +103,6 @@ func extractKeycloakSub(tokenStr string) string {
 	return claims.Sub
 }
 
-// ChunkedUploadHeader is Frame 0 of the AES-256-GCM-CHUNKED-v1 stream.
-type ChunkedUploadHeader struct {
-	FileID          string `json:"file_id"`
-	Enc             string `json:"enc"`         // base64std HPKE encapsulated key (32 bytes)
-	WrappedKey      string `json:"wrapped_key"` // base64std HPKE-wrapped AES-256 key (48 bytes)
-	BaseIV          string `json:"base_iv"`     // base64std 12-byte base IV; chunk i uses BaseIV+i (96-bit big-endian)
-	TotalChunks     int    `json:"total_chunks"`
-	PlaintextSHA256 string `json:"plaintext_sha256"` // hex SHA256 of assembled plaintext
-}
-
 // HandleSubmit serves POST /v1/submit.
 // Receives HPKE-encrypted metadata only — no model bytes in this call.
 // Returns {job_id, status} encrypted back to browser.
@@ -192,168 +178,192 @@ func (s *Server) HandleSubmit(w http.ResponseWriter, r *http.Request) {
 }
 
 // HandleUpload serves PUT /v1/upload/{job_id}/{slot} for every upload slot
-// (model, weights, adaptor — see jobs.Artifacts). It decrypts the
-// AES-256-GCM-CHUNKED-v1 stream and hands the plaintext to the job store,
-// which verifies the submit-time SHA-256 commitment and queues the job once
-// every expected slot is present.
+// (model, weights, adaptor, input_spec — see jobs.Artifacts). The
+// AES-256-GCM-CHUNKED-v1 stream is written to disk exactly as uploaded, still
+// encrypted, while its framing is checked (every chunk the header announces,
+// nothing after); its AES key is unwrapped from HPKE and kept in memory by
+// the store. Nothing is decrypted here: the Processing TEE decrypts the
+// stream and verifies it against the submit-time SHA-256. Memory use is a
+// small copy buffer whatever the file's size.
 func (s *Server) HandleUpload(w http.ResponseWriter, r *http.Request) {
 	jobID, slot := r.PathValue("job_id"), r.PathValue("slot")
-	if _, ok := jobs.ArtifactBySlot(slot); !ok {
-		writeJSON(w, http.StatusNotFound, map[string]any{"status": "error", "message": "unknown upload slot: " + slot})
+	started := time.Now()
+	dir, err := s.store.BeginUpload(jobID, slot)
+	if err != nil {
+		uploadError(w, err)
 		return
 	}
-	plaintext, err := s.decryptChunkedUpload(r.Body, r.Header.Get("X-RATLS-Browser-HPKE"))
-	if err != nil {
-		log.Printf("%s upload decrypt %s: %v", slot, jobID, err)
-		http.Error(w, "decryption failed: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-	job, err := s.store.ReceiveArtifact(jobID, slot, plaintext)
-	if err != nil {
-		code := http.StatusBadRequest
-		if strings.Contains(err.Error(), "unknown job_id") ||
-			errors.Is(err, jobs.ErrUnknownSlot) || errors.Is(err, jobs.ErrSlotNotAllowed) {
-			code = http.StatusNotFound
+	defer s.store.EndUpload(jobID, slot)
+	if r.ContentLength > 0 {
+		if err := checkDiskSpace(dir, r.ContentLength); err != nil {
+			writeJSON(w, http.StatusInsufficientStorage, map[string]any{"status": "error", "message": err.Error()})
+			return
 		}
-		writeJSON(w, code, map[string]any{"status": "error", "message": err.Error()})
+	}
+
+	rc := http.NewResponseController(w)
+	body := &idleDeadlineReader{r: r.Body, rc: rc}
+	up, err := s.receiveUpload(body, r.Header.Get("X-RATLS-Browser-HPKE"), dir, slot)
+	// The upload may have outlasted the server's WriteTimeout; leave time to reply.
+	_ = rc.SetWriteDeadline(time.Now().Add(time.Minute))
+	if err != nil {
+		log.Printf("upload %s/%s rejected: %v", jobID, slot, err)
+		code := http.StatusBadRequest
+		var we *writeError
+		if errors.As(err, &we) {
+			code = http.StatusInternalServerError
+		}
+		writeJSON(w, code, map[string]any{"status": "error", "message": "upload rejected: " + err.Error()})
 		return
 	}
+	job, err := s.store.CommitUpload(jobID, slot, up)
+	if err != nil {
+		os.Remove(up.Path)
+		clear(up.Key)
+		uploadError(w, err)
+		return
+	}
+	log.Printf("upload %s/%s stored: %d bytes in %s (%s)", jobID, slot, up.PlainSize,
+		time.Since(started).Round(time.Millisecond), memoryUsage())
 	if job.Status == jobs.StatusQueued {
 		log.Printf("job %s all required files received — queued", jobID)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status": job.Status,
 		"job_id": jobID,
-		"bytes":  len(plaintext),
+		"bytes":  up.PlainSize,
 	})
 }
 
-// decryptChunkedUpload reads and decrypts an AES-256-GCM-CHUNKED-v1 framed stream.
-//
-// Wire format:
-//
-//	[4 bytes big-endian: header JSON length]
-//	[header JSON]
-//	for each chunk i in 0..totalChunks-1:
-//	  [4 bytes big-endian: ciphertext length]
-//	  [ciphertext bytes]  (plaintext + 16-byte GCM tag)
-//
-// Per-chunk IV: baseIV + i (96-bit big-endian increment of the 12-byte base IV)
-// Per-chunk AAD:   "{i}:{totalChunks}:{fileId}" as UTF-8
-func (s *Server) decryptChunkedUpload(body io.Reader, browserPubB64u string) ([]byte, error) {
+// uploadError maps a store refusal to its HTTP status.
+func uploadError(w http.ResponseWriter, err error) {
+	code := http.StatusBadRequest
+	switch {
+	case strings.Contains(err.Error(), "unknown job_id"),
+		errors.Is(err, jobs.ErrUnknownSlot), errors.Is(err, jobs.ErrSlotNotAllowed):
+		code = http.StatusNotFound
+	case errors.Is(err, jobs.ErrUploadInProgress):
+		code = http.StatusConflict
+	}
+	writeJSON(w, code, map[string]any{"status": "error", "message": err.Error()})
+}
+
+// writeError marks a failure to write the upload to disk (a server fault, not
+// a bad upload).
+type writeError struct{ err error }
+
+func (e *writeError) Error() string { return "store upload: " + e.err.Error() }
+func (e *writeError) Unwrap() error { return e.err }
+
+// receiveUpload reads the stream header, unwraps its AES key, and writes the
+// whole stream — header and chunks, unchanged — to a temp file in dir,
+// checking the framing as it goes. On success the caller owns the file and
+// the key.
+func (s *Server) receiveUpload(body io.Reader, browserPubB64u, dir, slot string) (up jobs.Upload, err error) {
+	hdr, rawHeader, err := chunked.ReadHeader(body)
+	if err != nil {
+		return up, err
+	}
+	key, err := s.unwrapUploadKey(hdr, browserPubB64u)
+	if err != nil {
+		return up, err
+	}
+	f, err := os.CreateTemp(dir, slot+"-*.part")
+	if err != nil {
+		clear(key)
+		return up, &writeError{err}
+	}
+	defer func() {
+		if err != nil {
+			f.Close()
+			os.Remove(f.Name())
+			clear(key)
+		}
+	}()
+
+	out := &recordingWriter{w: bufio.NewWriterSize(f, 1<<20)}
+	if _, err := out.Write(rawHeader); err != nil {
+		return up, &writeError{err}
+	}
+	plainSize, err := chunked.CopyChunks(body, hdr, out)
+	if out.err != nil {
+		return up, &writeError{out.err}
+	}
+	if err != nil {
+		return up, err
+	}
+	if err := out.w.Flush(); err != nil {
+		return up, &writeError{err}
+	}
+	if err := f.Sync(); err != nil {
+		return up, &writeError{err}
+	}
+	if err := f.Close(); err != nil {
+		return up, &writeError{err}
+	}
+	return jobs.Upload{Path: f.Name(), Key: key, PlainSHA256: hdr.PlaintextSHA256, PlainSize: plainSize}, nil
+}
+
+// unwrapUploadKey opens the stream's HPKE-wrapped AES-256 key with the
+// Buffer's current HPKE key. It must happen at upload: HPKE keys rotate, so a
+// wrapped key kept for later could become unopenable.
+func (s *Server) unwrapUploadKey(hdr chunked.Header, browserPubB64u string) ([]byte, error) {
 	if browserPubB64u == "" {
 		return nil, fmt.Errorf("missing X-RATLS-Browser-HPKE header")
 	}
-	browserPubBytes, err := base64.RawURLEncoding.DecodeString(browserPubB64u)
-	if err != nil || len(browserPubBytes) != 32 {
+	browserPub, err := base64.RawURLEncoding.DecodeString(browserPubB64u)
+	if err != nil || len(browserPub) != 32 {
 		return nil, fmt.Errorf("bad X-RATLS-Browser-HPKE")
 	}
-
-	// Frame 0: 4-byte header length + header JSON
-	var headerLen uint32
-	if err := binary.Read(body, binary.BigEndian, &headerLen); err != nil {
-		return nil, fmt.Errorf("read header length: %w", err)
-	}
-	if headerLen == 0 || headerLen > maxHeaderBytes {
-		return nil, fmt.Errorf("invalid header length: %d", headerLen)
-	}
-	headerBytes := make([]byte, headerLen)
-	if _, err := io.ReadFull(body, headerBytes); err != nil {
-		return nil, fmt.Errorf("read header: %w", err)
-	}
-
-	var hdr ChunkedUploadHeader
-	if err := json.Unmarshal(headerBytes, &hdr); err != nil {
-		return nil, fmt.Errorf("parse header: %w", err)
-	}
-	if hdr.TotalChunks <= 0 || hdr.TotalChunks > maxTotalChunks {
-		return nil, fmt.Errorf("invalid total_chunks: %d", hdr.TotalChunks)
-	}
-	if hdr.FileID == "" {
-		return nil, fmt.Errorf("missing file_id")
-	}
-
-	// Decode HPKE-wrapped AES key
-	encBytes, err := base64.StdEncoding.DecodeString(hdr.Enc)
+	enc, err := base64.StdEncoding.DecodeString(hdr.Enc)
 	if err != nil {
 		return nil, fmt.Errorf("decode enc: %w", err)
 	}
-	wrappedKey, err := base64.StdEncoding.DecodeString(hdr.WrappedKey)
+	wrapped, err := base64.StdEncoding.DecodeString(hdr.WrappedKey)
 	if err != nil {
 		return nil, fmt.Errorf("decode wrapped_key: %w", err)
 	}
-	baseIV, err := base64.StdEncoding.DecodeString(hdr.BaseIV)
-	if err != nil || len(baseIV) != 12 {
-		return nil, fmt.Errorf("bad base_iv: must be 12 bytes")
-	}
-
-	// HPKE-unwrap the symmetric key (no AAD — key wrapping uses info binding only)
+	// No AAD — key wrapping uses info binding only.
 	hpkePriv, hpkePub := s.builder.HPKEKeys()
-	info := hpkepkg.ContextInfo(hpkePub.Bytes(), browserPubBytes)
-	aesKeyBytes, err := hpkepkg.OpenFromBrowser(hpkePriv, encBytes, info, nil, wrappedKey)
+	info := hpkepkg.ContextInfo(hpkePub.Bytes(), browserPub)
+	key, err := hpkepkg.OpenFromBrowser(hpkePriv, enc, info, nil, wrapped)
 	if err != nil {
 		return nil, fmt.Errorf("hpke key unwrap: %w", err)
 	}
-	if len(aesKeyBytes) != aesKeyLen {
-		return nil, fmt.Errorf("unwrapped key wrong length: %d", len(aesKeyBytes))
+	if len(key) != aesKeyLen {
+		clear(key)
+		return nil, fmt.Errorf("unwrapped key is %d bytes, want %d", len(key), aesKeyLen)
 	}
+	return key, nil
+}
 
-	// Import AES-256-GCM; zero key bytes immediately after
-	block, err := aes.NewCipher(aesKeyBytes)
-	for i := range aesKeyBytes {
-		aesKeyBytes[i] = 0
+// recordingWriter remembers the first write failure, so a full disk is told
+// apart from a bad upload.
+type recordingWriter struct {
+	w   *bufio.Writer
+	err error
+}
+
+func (rw *recordingWriter) Write(p []byte) (int, error) {
+	n, err := rw.w.Write(p)
+	if err != nil && rw.err == nil {
+		rw.err = err
 	}
-	if err != nil {
-		return nil, fmt.Errorf("aes.NewCipher: %w", err)
+	return n, err
+}
+
+// checkDiskSpace refuses an upload that would not fit, with 10% to spare.
+func checkDiskSpace(dir string, size int64) error {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(dir, &st); err != nil {
+		log.Printf("upload: free disk space check skipped: %v", err)
+		return nil
 	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, fmt.Errorf("cipher.NewGCM: %w", err)
+	free := st.Bavail * uint64(st.Bsize)
+	if need := uint64(size) + uint64(size)/10; free < need {
+		return fmt.Errorf("the upload needs %d bytes of disk, %d free", need, free)
 	}
-
-	// Decrypt chunks; nonce starts at baseIV and increments by 1 (big-endian) each chunk.
-	nonce := make([]byte, 12)
-	copy(nonce, baseIV)
-	var assembled []byte
-
-	for i := 0; i < hdr.TotalChunks; i++ {
-		var chunkLen uint32
-		if err := binary.Read(body, binary.BigEndian, &chunkLen); err != nil {
-			return nil, fmt.Errorf("read chunk %d length: %w", i, err)
-		}
-		ct := make([]byte, chunkLen)
-		if _, err := io.ReadFull(body, ct); err != nil {
-			return nil, fmt.Errorf("read chunk %d data: %w", i, err)
-		}
-
-		aad := []byte(fmt.Sprintf("%d:%d:%s", i, hdr.TotalChunks, hdr.FileID))
-
-		pt, err := gcm.Open(nil, nonce, ct, aad)
-		if err != nil {
-			return nil, fmt.Errorf("chunk %d authentication failed", i)
-		}
-		assembled = append(assembled, pt...)
-
-		// increment nonce by 1 (big-endian, with carry) for the next chunk
-		for j := 11; j >= 0; j-- {
-			nonce[j]++
-			if nonce[j] != 0 {
-				break
-			}
-		}
-	}
-
-	// Verify SHA-256 of assembled plaintext against header commitment
-	if hdr.PlaintextSHA256 != "" {
-		digest := cryptosha256.Sum256(assembled)
-		if hex.EncodeToString(digest[:]) != hdr.PlaintextSHA256 {
-			return nil, fmt.Errorf("plaintext sha256 mismatch")
-		}
-	}
-
-	log.Printf("chunked upload: decrypted %d bytes in %d chunks (file_id=%s)",
-		len(assembled), hdr.TotalChunks, hdr.FileID)
-	return assembled, nil
+	return nil
 }
 
 // processJob creates the job record in the in-process store. The response

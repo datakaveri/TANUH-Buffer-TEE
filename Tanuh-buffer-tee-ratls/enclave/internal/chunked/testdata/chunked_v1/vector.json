@@ -1,0 +1,7 @@
+{
+  "description": "AES-256-GCM-CHUNKED-v1 golden vector: 3 chunks (16,16,8 bytes); base_iv ends 0xff 0xfe so chunk 2's IV carries across two bytes. Shared by TANUH-Buffer-TEE and TANUH-Processing-TEE.",
+  "key_b64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+  "plaintext_b64": "dGhlIHF1aWNrIGJyb3duIGZveCBqdW1wcyBvdmVyIGxhenkgZG9nIQ==",
+  "plaintext_sha256": "e5ab68419af6b4a9bdfb6f1aac72dc65c9113fc6500414ce0418a1f642459aa1",
+  "stream_b64": "AAAAt3siYmFzZV9pdiI6IkFRSURCQVVHQndnSkN2LysiLCJlbmMiOiIiLCJmaWxlX2lkIjoiZ29sZGVuLWZpbGUiLCJwbGFpbnRleHRfc2hhMjU2IjoiZTVhYjY4NDE5YWY2YjRhOWJkZmI2ZjFhYWM3MmRjNjVjOTExM2ZjNjUwMDQxNGNlMDQxOGExZjY0MjQ1OWFhMSIsInRvdGFsX2NodW5rcyI6Mywid3JhcHBlZF9rZXkiOiIifQAAACDPLYxpdgsEFSWBSNpnSRG3tMgzufOIMJAeUmsglRfekgAAACCDEf6MUGFP/QFLIf9whV/rzSvUa2g/Vm0ge2XanXHMbgAAABitdZsvjVE+rR9Gg4bU75G2yGPKQiHOh9s="
+}

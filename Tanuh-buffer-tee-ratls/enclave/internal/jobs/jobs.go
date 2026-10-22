@@ -1,16 +1,16 @@
 // Package jobs is the buffer's persistent job store: records, artifacts,
-// the ordered queue, and dispatch state. The on-disk layout is kept
-// byte-compatible with the former Python manager (jobs/<id>/job.json,
-// queue.json, runtime/dispatch_state.json, outgoing/*-secure-dispatch.json)
-// so a rollback to the Python image reads the same state and the same
-// debugging tooling keeps working.
+// the ordered queue, and dispatch state. The record layout follows the
+// former Python manager (jobs/<id>/job.json, queue.json,
+// runtime/dispatch_state.json). Artifacts are kept encrypted
+// (jobs/<id>/artifacts/<slot>.enc) and no dispatch payload is staged on disk.
 package jobs
 
 import (
+	"bytes"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -28,10 +28,10 @@ const (
 	StatusError         = "error"
 )
 
-// Delivery mirrors the Python "delivery" sub-object on dispatched jobs.
+// Delivery mirrors the Python "delivery" sub-object on dispatched jobs. The
+// payload is streamed from the stored artifacts, so nothing is staged on disk.
 type Delivery struct {
-	Mode        string `json:"mode"`
-	PayloadPath string `json:"payload_path"`
+	Mode string `json:"mode"`
 }
 
 // Job is the persisted job record. Field names match the Python manager's
@@ -65,18 +65,23 @@ type Job struct {
 
 // Store owns the on-disk job state. All mutation goes through one mutex —
 // job volume is single-digit concurrent, matching the Python file-lock model.
+//
+// Uploaded artifacts are stored as the browser sent them, still encrypted
+// (artifacts/<slot>.enc). Their AES keys are held only in memory (keys), never
+// on disk: the Processing TEE receives them with the ciphertext at dispatch.
 type Store struct {
-	mu   sync.Mutex
-	root string // <base>/cvm_workflow/buffer
+	mu        sync.Mutex
+	root      string                       // <base>/cvm_workflow/buffer
+	keys      map[string]map[string][]byte // job id -> slot -> AES-256 key
+	uploading map[string]bool              // "<job id>/<slot>" -> upload in progress
 }
 
 // Open creates the directory layout and returns the store.
 func Open(root string) (*Store, error) {
-	s := &Store{root: root}
+	s := &Store{root: root, keys: map[string]map[string][]byte{}, uploading: map[string]bool{}}
 	for _, d := range []string{
 		root,
 		s.jobsDir(),
-		filepath.Join(root, "outgoing"),
 		filepath.Join(root, "runtime"),
 		filepath.Join(root, "shared_artifacts"),
 	} {
@@ -94,11 +99,6 @@ func (s *Store) dispatchStatePath() string {
 }
 func (s *Store) jobDir(jobID string) string  { return filepath.Join(s.jobsDir(), jobID) }
 func (s *Store) jobPath(jobID string) string { return filepath.Join(s.jobDir(jobID), "job.json") }
-
-// OutgoingPayloadPath is where the secure dispatch payload for a job is staged.
-func (s *Store) OutgoingPayloadPath(jobID string) string {
-	return filepath.Join(s.root, "outgoing", jobID+"-secure-dispatch.json")
-}
 
 // ResultsPath is where per-job results would land (leaderboard-only today;
 // kept for the /v1/results contract).
@@ -164,11 +164,77 @@ func (s *Store) Create(req NewJobRequest) (*Job, error) {
 	return job, nil
 }
 
-// ReceiveArtifact stores an uploaded artifact for one slot, verifies it
-// against the SHA-256 committed at submit (fail closed: a slot with no
-// commitment accepts nothing), and queues the job once every expected slot is
-// present. Returns the updated job.
-func (s *Store) ReceiveArtifact(jobID, slot string, data []byte) (*Job, error) {
+// ErrUploadInProgress is returned for a second upload to a slot that is
+// still receiving one.
+var ErrUploadInProgress = errors.New("an upload to this slot is already in progress")
+
+// Upload is one received artifact, written to a file in the job's artifact
+// directory by the upload handler, ready to be committed.
+type Upload struct {
+	Path        string // the encrypted stream exactly as uploaded, synced to disk
+	Key         []byte // its AES-256 key; the store takes ownership
+	PlainSHA256 string // from the stream header; "" when the browser did not send one
+	PlainSize   int64  // plaintext bytes the stream holds
+}
+
+// BeginUpload checks that slot can take an upload for the job now — before
+// any bytes are read — and marks it in progress. It returns the directory to
+// write the upload's temp file in. Every successful call must be paired with
+// EndUpload.
+func (s *Store) BeginUpload(jobID, slot string) (string, error) {
+	spec, ok := ArtifactBySlot(slot)
+	if !ok {
+		return "", fmt.Errorf("%w: %s", ErrUnknownSlot, slot)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	job, err := s.getLocked(jobID)
+	if err != nil {
+		return "", err
+	}
+	if err := checkUploadLocked(job, spec); err != nil {
+		return "", err
+	}
+	if s.uploading[jobID+"/"+slot] {
+		return "", fmt.Errorf("%w: %s", ErrUploadInProgress, slot)
+	}
+	if err := os.MkdirAll(job.ArtifactDir, 0o700); err != nil {
+		return "", err
+	}
+	s.uploading[jobID+"/"+slot] = true
+	return job.ArtifactDir, nil
+}
+
+// EndUpload clears the in-progress mark set by BeginUpload.
+func (s *Store) EndUpload(jobID, slot string) {
+	s.mu.Lock()
+	delete(s.uploading, jobID+"/"+slot)
+	s.mu.Unlock()
+}
+
+// checkUploadLocked is the gate for every upload: the job must be awaiting
+// uploads, the slot must be used by its model format, and a SHA-256 must have
+// been committed for it at submit (fail closed: no commitment accepts nothing).
+func checkUploadLocked(job *Job, spec ArtifactSpec) error {
+	if job.Status != StatusPendingUpload {
+		return fmt.Errorf("job %s is not awaiting upload (status=%s)", job.JobID, job.Status)
+	}
+	if !spec.AllowedFor(job.ModelFormat) {
+		return fmt.Errorf("%w: %s for %s", ErrSlotNotAllowed, spec.Slot, job.ModelFormat)
+	}
+	if spec.Commitment(job) == "" {
+		return fmt.Errorf("no SHA-256 was committed for %s at submit", spec.Slot)
+	}
+	return nil
+}
+
+// CommitUpload stores a received upload as the slot's artifact and keeps its
+// key in memory, then queues the job once every expected slot is present.
+// The upload's content is not checked here: the Processing TEE decrypts it
+// and verifies it against the submit-time SHA-256. A hash the browser put in
+// the stream header must match that commitment. On error the caller still
+// owns up.Path and up.Key. Returns the updated job.
+func (s *Store) CommitUpload(jobID, slot string, up Upload) (*Job, error) {
 	spec, ok := ArtifactBySlot(slot)
 	if !ok {
 		return nil, fmt.Errorf("%w: %s", ErrUnknownSlot, slot)
@@ -180,40 +246,23 @@ func (s *Store) ReceiveArtifact(jobID, slot string, data []byte) (*Job, error) {
 	if err != nil {
 		return nil, err
 	}
-	if job.Status != StatusPendingUpload {
-		return nil, fmt.Errorf("job %s is not awaiting upload (status=%s)", jobID, job.Status)
-	}
-	if !spec.AllowedFor(job.ModelFormat) {
-		return nil, fmt.Errorf("%w: %s for %s", ErrSlotNotAllowed, slot, job.ModelFormat)
-	}
-	expected := spec.Commitment(job)
-	if expected == "" {
-		return nil, fmt.Errorf("no SHA-256 was committed for %s at submit", slot)
-	}
-	if int64(len(data)) > spec.MaxBytes {
-		return nil, fmt.Errorf("%s is %d bytes, over the %d-byte limit", slot, len(data), spec.MaxBytes)
-	}
-	sum := sha256.Sum256(data)
-	if hex.EncodeToString(sum[:]) != expected {
-		return nil, fmt.Errorf("SHA256 mismatch for %s", slot)
-	}
-
-	if err := os.MkdirAll(job.ArtifactDir, 0o755); err != nil {
+	if err := checkUploadLocked(job, spec); err != nil {
 		return nil, err
 	}
-	if err := os.WriteFile(filepath.Join(job.ArtifactDir, slot), data, 0o644); err != nil {
+	if up.PlainSHA256 != "" && strings.ToLower(up.PlainSHA256) != spec.Commitment(job) {
+		return nil, fmt.Errorf("SHA256 mismatch for %s: the uploaded file is not the one committed at submit", slot)
+	}
+	if err := os.Rename(up.Path, s.artifactPath(job, slot)); err != nil {
 		return nil, err
 	}
+	if s.keys[jobID] == nil {
+		s.keys[jobID] = map[string][]byte{}
+	}
+	clear(s.keys[jobID][slot]) // a re-upload replaces the earlier one
+	s.keys[jobID][slot] = up.Key
 	job.UpdatedAtUnix = time.Now().Unix()
 
-	required := true
-	for _, a := range Artifacts() {
-		if a.Expected(job) && !s.artifactExistsLocked(job, a.Slot) {
-			required = false
-			break
-		}
-	}
-	if required {
+	if s.readyLocked(job) {
 		job.Status = StatusQueued
 		if err := s.queueAppendLocked(jobID); err != nil {
 			return nil, err
@@ -225,23 +274,63 @@ func (s *Store) ReceiveArtifact(jobID, slot string, data []byte) (*Job, error) {
 	return job, nil
 }
 
-func (s *Store) artifactExistsLocked(job *Job, name string) bool {
-	_, err := os.Stat(filepath.Join(job.ArtifactDir, name))
-	return err == nil
+// readyLocked reports whether every artifact the job expects has been
+// stored with its key.
+func (s *Store) readyLocked(job *Job) bool {
+	for _, a := range Artifacts() {
+		if !a.Expected(job) {
+			continue
+		}
+		if _, err := os.Stat(s.artifactPath(job, a.Slot)); err != nil || s.keys[job.JobID][a.Slot] == nil {
+			return false
+		}
+	}
+	return true
 }
 
-// ArtifactBytes returns a stored artifact's contents by slot.
-func (s *Store) ArtifactBytes(jobID, slot string) ([]byte, error) {
+func (s *Store) artifactPath(job *Job, slot string) string {
+	return filepath.Join(job.ArtifactDir, slot+".enc")
+}
+
+// StoredArtifact is an artifact ready to forward: its encrypted stream on
+// disk and a copy of its key.
+type StoredArtifact struct {
+	Path string
+	Size int64 // bytes of the encrypted stream
+	Key  []byte
+}
+
+// Artifact returns a stored artifact by slot. The key is a copy; the caller
+// should clear it after use.
+func (s *Store) Artifact(jobID, slot string) (StoredArtifact, error) {
 	if _, ok := ArtifactBySlot(slot); !ok {
-		return nil, fmt.Errorf("%w: %s", ErrUnknownSlot, slot)
+		return StoredArtifact{}, fmt.Errorf("%w: %s", ErrUnknownSlot, slot)
 	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	job, err := s.getLocked(jobID)
-	s.mu.Unlock()
 	if err != nil {
-		return nil, err
+		return StoredArtifact{}, err
 	}
-	return os.ReadFile(filepath.Join(job.ArtifactDir, slot))
+	key := s.keys[jobID][slot]
+	if key == nil {
+		return StoredArtifact{}, fmt.Errorf("the %s upload key is no longer held (the Buffer TEE restarted since the upload); resubmit the job", slot)
+	}
+	path := s.artifactPath(job, slot)
+	info, err := os.Stat(path)
+	if err != nil {
+		return StoredArtifact{}, fmt.Errorf("%s artifact missing: %w", slot, err)
+	}
+	return StoredArtifact{Path: path, Size: info.Size(), Key: bytes.Clone(key)}, nil
+}
+
+// forgetKeysLocked zeroes and drops a job's upload keys once it can no longer
+// be dispatched.
+func (s *Store) forgetKeysLocked(jobID string) {
+	for _, k := range s.keys[jobID] {
+		clear(k)
+	}
+	delete(s.keys, jobID)
 }
 
 // Get returns one job.
@@ -321,8 +410,9 @@ func (s *Store) Dispatched() ([]*Job, error) {
 }
 
 // MarkDispatched transitions queued → dispatched and removes the job from
-// the queue.
-func (s *Store) MarkDispatched(jobID, payloadPath, addr string) (*Job, error) {
+// the queue. The upload keys are kept: a dispatch lost with its TEE is
+// requeued and sent again.
+func (s *Store) MarkDispatched(jobID, addr string) (*Job, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	job, err := s.getLocked(jobID)
@@ -334,7 +424,7 @@ func (s *Store) MarkDispatched(jobID, payloadPath, addr string) (*Job, error) {
 	job.AssignedTEE = addr
 	job.DispatchedAtUnix = now
 	job.UpdatedAtUnix = now
-	job.Delivery = &Delivery{Mode: "ratls_json_payload", PayloadPath: payloadPath}
+	job.Delivery = &Delivery{Mode: "ratls_multipart_v3"}
 	if err := s.saveLocked(job); err != nil {
 		return nil, err
 	}
@@ -368,6 +458,7 @@ func (s *Store) Complete(jobID string, succeeded bool, errInfo map[string]any) (
 		return nil, err
 	}
 	s.queueRemoveLocked(jobID)
+	s.forgetKeysLocked(jobID)
 	return job, nil
 }
 
@@ -416,6 +507,7 @@ func (s *Store) Fail(jobID, source string, errInfo map[string]any) (*Job, error)
 		return nil, err
 	}
 	s.queueRemoveLocked(jobID)
+	s.forgetKeysLocked(jobID)
 	return job, nil
 }
 
@@ -438,10 +530,10 @@ func (s *Store) CleanupOld(retention time.Duration) []string {
 		if now-j.UpdatedAtUnix < int64(retention.Seconds()) {
 			continue
 		}
+		s.forgetKeysLocked(j.JobID)
 		if err := os.RemoveAll(s.jobDir(j.JobID)); err == nil {
 			removed = append(removed, j.JobID)
 		}
-		_ = os.Remove(s.OutgoingPayloadPath(j.JobID))
 	}
 	return removed
 }
@@ -536,7 +628,17 @@ func (s *Store) saveLocked(job *Job) error {
 	if err := os.MkdirAll(s.jobDir(job.JobID), 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(s.jobPath(job.JobID), raw, 0o644)
+	return writeFileAtomic(s.jobPath(job.JobID), raw)
+}
+
+// writeFileAtomic replaces path with data via a temp file and rename, so a
+// crash mid-write never leaves a truncated record.
+func writeFileAtomic(path string, data []byte) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 func (s *Store) readQueueLocked() []string {
@@ -561,7 +663,7 @@ func (s *Store) writeQueueLocked(ids []string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.queuePath(), raw, 0o644)
+	return writeFileAtomic(s.queuePath(), raw)
 }
 
 func (s *Store) queueAppendLocked(jobID string) error {

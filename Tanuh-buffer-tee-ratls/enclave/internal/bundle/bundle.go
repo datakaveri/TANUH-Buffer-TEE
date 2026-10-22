@@ -49,6 +49,13 @@ func NewBuilder(ctx context.Context, audience string) (*Builder, error) {
 	}, nil
 }
 
+// NewWithKeys returns a Builder over existing keys with no attestation token,
+// for tests of the handlers that only need the HPKE keys. The serving path
+// always uses NewBuilder.
+func NewWithKeys(audience string, k *keys.EnclaveKeys) *Builder {
+	return &Builder{audience: audience, keys: k, issuedAt: time.Now().Unix()}
+}
+
 // Build signs the browser's liveness nonce and returns an attestation bundle.
 func (b *Builder) Build(nonce []byte) (*AttestBundle, error) {
 	b.mu.RLock()

@@ -38,13 +38,13 @@ var (
 )
 
 // ArtifactSpec is one upload slot: which formats use it, whether a job can be
-// queued without it, its size limit, and the submit-time SHA-256 it must match.
-// This table is the single definition used by the store, the upload route and
-// the dispatch payload.
+// queued without it, and the submit-time SHA-256 it must match. This table is
+// the single definition used by the store, the upload route and the dispatch
+// payload. File sizes are not capped here: uploads stream to disk and the UI
+// caps what users can upload.
 type ArtifactSpec struct {
 	Slot           string
 	AlwaysRequired bool // required for every job; otherwise required only when its hash was committed
-	MaxBytes       int64
 	allowed        func(format string) bool
 	commitment     func(*Job) string
 }
@@ -53,26 +53,22 @@ var artifactSpecs = []ArtifactSpec{
 	{
 		Slot:           SlotModel,
 		AlwaysRequired: true,
-		MaxBytes:       4 << 30,
 		allowed:        func(string) bool { return true },
 		commitment:     func(j *Job) string { return j.ModelSHA256 },
 	},
 	{
 		Slot:       SlotWeights,
-		MaxBytes:   4 << 30,
 		allowed:    func(f string) bool { return f == FormatONNX },
 		commitment: func(j *Job) string { return j.WeightsSHA256 },
 	},
 	{
 		Slot:           SlotAdaptor,
 		AlwaysRequired: true,
-		MaxBytes:       1 << 20,
 		allowed:        func(string) bool { return true },
 		commitment:     func(j *Job) string { return j.AdaptorSHA },
 	},
 	{
 		Slot:       SlotInputSpec,
-		MaxBytes:   64 << 10,
 		allowed:    func(f string) bool { return f == FormatONNX || f == FormatTorchScript },
 		commitment: func(j *Job) string { return j.InputSpecSHA },
 	},

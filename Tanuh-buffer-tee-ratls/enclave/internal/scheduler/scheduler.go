@@ -1,6 +1,6 @@
 // Package scheduler runs the buffer's background loop: retention cleanup,
 // queue-stall warnings, crash recovery for dispatched jobs that never called
-// back, and the dispatch cycle (provision → build payload → RA-TLS deliver).
+// back, and the dispatch cycle (check payload → provision → RA-TLS stream).
 //
 // Completion is callback-driven (the Processing TEE POSTs its terminal
 // status to /v1/jobs/{id}/complete). A dispatched job is requeued ONLY when
@@ -12,17 +12,20 @@ package scheduler
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
+	"mime/multipart"
+	"net/textproto"
 	"os"
-	"path/filepath"
 	"time"
 
+	"github.com/datakaveri/tanuh-buffer-tee/internal/chunked"
 	"github.com/datakaveri/tanuh-buffer-tee/internal/config"
+	"github.com/datakaveri/tanuh-buffer-tee/internal/dispatch"
 	"github.com/datakaveri/tanuh-buffer-tee/internal/jobs"
 	"github.com/datakaveri/tanuh-buffer-tee/internal/provision"
 )
@@ -33,8 +36,9 @@ type Scheduler struct {
 	Store  *jobs.Store
 	Engine *provision.Engine
 	Health provision.Health
-	// Deliver is dispatch.Deliver, injectable for tests.
-	Deliver func(ctx context.Context, addr, audience, digest string, payload []byte) error
+	// Deliver is dispatch.Deliver, injectable for tests. writeBody streams
+	// the request body; contentType carries its multipart boundary.
+	Deliver func(ctx context.Context, addr, audience, digest, contentType string, writeBody func(io.Writer) error) error
 }
 
 // Run ticks until ctx is cancelled.
@@ -129,20 +133,21 @@ func (s *Scheduler) dispatchNext(ctx context.Context) {
 		"last_dispatch_error":        "",
 	})
 
-	// Build the payload before provisioning: a job whose artifacts are missing
-	// or no longer match their submit-time hashes can never run, so fail it
-	// instead of starting a VM and retrying it every tick.
-	payload, err := s.buildPayload(job)
+	// Check the payload before provisioning: a job whose artifacts or upload
+	// keys are gone can never run, so fail it instead of starting a VM and
+	// retrying it every tick.
+	p, err := s.preparePayload(job)
 	if err != nil {
-		log.Printf("scheduler: build payload for %s: %v — failing job", job.JobID, err)
+		log.Printf("scheduler: prepare payload for %s: %v — failing job", job.JobID, err)
 		if _, ferr := s.Store.Fail(job.JobID, "buffer_dispatch", map[string]any{
-			"error_type":    "ArtifactIntegrityError",
+			"error_type":    "ArtifactUnavailable",
 			"error_message": err.Error(),
 		}); ferr != nil {
 			log.Printf("scheduler: fail job %s: %v", job.JobID, ferr)
 		}
 		return
 	}
+	defer p.clear()
 
 	res, err := s.Engine.Provision(ctx, job)
 	if err != nil {
@@ -153,25 +158,13 @@ func (s *Scheduler) dispatchNext(ctx context.Context) {
 		log.Printf("scheduler: job %s: no Processing TEE available this cycle — leaving queued", job.JobID)
 		return
 	}
-	payloadPath := s.Store.OutgoingPayloadPath(job.JobID)
-	if err := os.MkdirAll(filepath.Dir(payloadPath), 0o755); err == nil {
-		if err := os.WriteFile(payloadPath, payload, 0o644); err != nil {
-			log.Printf("scheduler: stage payload for %s: %v", job.JobID, err)
-		}
-	}
 
-	if err := s.Deliver(ctx, res.Target.Addr, s.Cfg.DispatchAudience, res.Target.ImageDigest, payload); err != nil {
-		log.Printf("scheduler: dispatch failed for %s: %v", job.JobID, err)
-		s.Store.UpdateDispatchState(map[string]any{
-			"last_dispatch_attempt_unix": time.Now().Unix(),
-			"last_dispatch_job_id":       job.JobID,
-			"last_dispatch_status":       "dispatch_failed",
-			"last_dispatch_error":        err.Error(),
-		})
+	if err := s.Deliver(ctx, res.Target.Addr, s.Cfg.DispatchAudience, res.Target.ImageDigest, p.contentType(), p.write); err != nil {
+		s.dispatchFailed(job, err)
 		return
 	}
 
-	if _, err := s.Store.MarkDispatched(job.JobID, payloadPath, res.Target.Addr); err != nil {
+	if _, err := s.Store.MarkDispatched(job.JobID, res.Target.Addr); err != nil {
 		log.Printf("scheduler: mark dispatched %s: %v", job.JobID, err)
 		return
 	}
@@ -184,39 +177,82 @@ func (s *Scheduler) dispatchNext(ctx context.Context) {
 	log.Printf("scheduler: job %s dispatched successfully via RA-TLS (%s)", job.JobID, res.Target.Name)
 }
 
-// PayloadVersion identifies the Buffer → Processing TEE payload layout. The
-// Processing TEE refuses any other version, so both sides must ship together.
-const PayloadVersion = 2
+// dispatchFailed records a failed delivery. A refusal the Processing TEE will
+// repeat for this payload (a bad upload, a version mismatch, no disk for it)
+// fails the job, so it is not resent — and a VM started — every tick. Anything
+// else (busy, network, a stall) leaves the job queued for the next tick.
+func (s *Scheduler) dispatchFailed(job *jobs.Job, err error) {
+	log.Printf("scheduler: dispatch failed for %s: %v", job.JobID, err)
+	status := "dispatch_failed"
+	var rejected *dispatch.RejectedError
+	if errors.As(err, &rejected) && rejected.Permanent() {
+		status = "dispatch_rejected"
+		log.Printf("scheduler: job %s refused by the Processing TEE (%d) — failing job", job.JobID, rejected.Status)
+		if _, ferr := s.Store.Fail(job.JobID, "processing_intake", map[string]any{
+			"error_type":    "PayloadRejected",
+			"error_message": rejected.Message,
+		}); ferr != nil {
+			log.Printf("scheduler: fail job %s: %v", job.JobID, ferr)
+		}
+	}
+	s.Store.UpdateDispatchState(map[string]any{
+		"last_dispatch_attempt_unix": time.Now().Unix(),
+		"last_dispatch_job_id":       job.JobID,
+		"last_dispatch_status":       status,
+		"last_dispatch_error":        err.Error(),
+	})
+}
 
-// buildPayload assembles the secure dispatch payload (version 2):
+// PayloadVersion identifies the Buffer → Processing TEE payload layout. The
+// Processing TEE accepts only this version, so both sides ship together.
+const PayloadVersion = 3
+
+// payload is one job's dispatch body (version 3), streamed as
+// multipart/form-data:
 //
-//	{"payload_version": 2, "job_id", "dataset_id", "model_format",
-//	 "submitted_at_unix", "submitted_by", "keycloak_token", "buffer_job_url",
-//	 "artifacts": {"<slot>": {"sha256": "<hex>", "base64": "<bytes>"}}}
+//	part "metadata"  {"payload_version": 3, "job_id", "dataset_id", "model_format",
+//	                  "submitted_at_unix", "submitted_by", "keycloak_token", "buffer_job_url",
+//	                  "artifacts": {"<slot>": {"encoding", "sha256", "ciphertext_size", "aes_key"}}}
+//	part "<slot>"    the artifact's encrypted stream, exactly as the browser uploaded it
 //
-// Every artifact the job expects is re-hashed and must still equal the
-// SHA-256 committed at submit.
-func (s *Scheduler) buildPayload(job *jobs.Job) ([]byte, error) {
+// The artifacts stay encrypted on disk and are copied straight into the
+// request, so memory does not grow with their size. The AES keys travel
+// inside the RA-TLS channel; the Processing TEE decrypts each artifact and
+// checks it against the SHA-256 committed at submit.
+type payload struct {
+	boundary string
+	metadata []byte // holds the AES keys: cleared after delivery
+	parts    []payloadPart
+}
+
+type payloadPart struct {
+	slot, path string
+	size       int64
+}
+
+// preparePayload checks that every artifact the job expects is stored with
+// its upload key, and builds the metadata part. Call clear when done.
+func (s *Scheduler) preparePayload(job *jobs.Job) (*payload, error) {
+	p := &payload{boundary: multipart.NewWriter(io.Discard).Boundary()}
 	artifacts := map[string]any{}
 	for _, a := range jobs.Artifacts() {
 		if !a.Expected(job) {
 			continue
 		}
-		data, err := s.Store.ArtifactBytes(job.JobID, a.Slot)
+		stored, err := s.Store.Artifact(job.JobID, a.Slot)
 		if err != nil {
-			return nil, fmt.Errorf("read %s: %w", a.Slot, err)
+			return nil, err
 		}
-		sum := sha256.Sum256(data)
-		got := hex.EncodeToString(sum[:])
-		if got != a.Commitment(job) {
-			return nil, fmt.Errorf("%s does not match its submit-time SHA-256", a.Slot)
+		artifacts[a.Slot] = map[string]any{
+			"encoding":        chunked.Encoding,
+			"sha256":          a.Commitment(job),
+			"ciphertext_size": stored.Size,
+			"aes_key":         base64.StdEncoding.EncodeToString(stored.Key),
 		}
-		artifacts[a.Slot] = map[string]string{
-			"sha256": got,
-			"base64": base64.StdEncoding.EncodeToString(data),
-		}
+		clear(stored.Key)
+		p.parts = append(p.parts, payloadPart{slot: a.Slot, path: stored.Path, size: stored.Size})
 	}
-	return json.Marshal(map[string]any{
+	meta, err := json.Marshal(map[string]any{
 		"payload_version":   PayloadVersion,
 		"job_id":            job.JobID,
 		"dataset_id":        job.DatasetID,
@@ -227,4 +263,62 @@ func (s *Scheduler) buildPayload(job *jobs.Job) ([]byte, error) {
 		"buffer_job_url":    s.Cfg.CallbackBase + "/v1/jobs/" + job.JobID,
 		"artifacts":         artifacts,
 	})
+	if err != nil {
+		return nil, err
+	}
+	p.metadata = meta
+	return p, nil
 }
+
+func (p *payload) contentType() string { return "multipart/form-data; boundary=" + p.boundary }
+
+// write streams the body to w: the metadata, then each artifact file. A file
+// whose size changed since preparePayload fails the write.
+func (p *payload) write(w io.Writer) error {
+	mw := multipart.NewWriter(w)
+	if err := mw.SetBoundary(p.boundary); err != nil {
+		return err
+	}
+	part := func(name, contentType string) (io.Writer, error) {
+		h := textproto.MIMEHeader{}
+		h.Set("Content-Disposition", fmt.Sprintf("form-data; name=%q", name))
+		h.Set("Content-Type", contentType)
+		return mw.CreatePart(h)
+	}
+	pw, err := part("metadata", "application/json")
+	if err != nil {
+		return err
+	}
+	if _, err := pw.Write(p.metadata); err != nil {
+		return err
+	}
+	for _, a := range p.parts {
+		pw, err := part(a.slot, "application/octet-stream")
+		if err != nil {
+			return err
+		}
+		if err := copyFile(pw, a.path, a.size); err != nil {
+			return fmt.Errorf("send %s: %w", a.slot, err)
+		}
+	}
+	return mw.Close()
+}
+
+func copyFile(w io.Writer, path string, size int64) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	n, err := io.Copy(w, f)
+	if err != nil {
+		return err
+	}
+	if n != size {
+		return fmt.Errorf("file is %d bytes, expected %d", n, size)
+	}
+	return nil
+}
+
+// clear wipes the metadata, which holds the AES keys.
+func (p *payload) clear() { clear(p.metadata) }
