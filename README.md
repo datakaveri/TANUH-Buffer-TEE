@@ -12,7 +12,8 @@ Browser
   │  AES-256-GCM chunked files (PUT  /v1/upload/:job_id/model|weights|adaptor)
   ▼
 buffer-tee (Go, :8443, TLS 1.3, Keycloak JWT)
-  ├─ HPKE / AES-GCM decrypt + SHA-256 verification
+  ├─ HPKE metadata decrypt; uploads stored still encrypted (framing checked,
+  │    AES key HPKE-unwrapped and held in memory only)
   ├─ job store + ordered queue   (cvm_workflow/buffer/, JSON on disk)
   ├─ scheduler (every 15 s): retention cleanup, stall warnings,
   │    bounded crash recovery, dispatch cycle
@@ -38,7 +39,7 @@ buffer-tee (Go, :8443, TLS 1.3, Keycloak JWT)
    | `weights` | `.onnx.data` (if committed) | — | — |
    | `adaptor` | `adaptor.py` (required) | `adaptor.py` (required) | `adaptor.py` (required) |
    | `input_spec` | `input_spec.json` (if committed) | `input_spec.json` (if committed) | — |
-3. Scheduler re-checks every stored artifact against its commitment (a mismatch fails the job), provisions a Processing TEE (GPU attempts → CPU fallback) and dispatches payload v2 over RA-TLS → `dispatched`
+3. Scheduler checks every stored artifact and its key are present (else the job fails before a VM starts), provisions a Processing TEE (GPU attempts → CPU fallback) and streams payload v3 over RA-TLS — metadata with the per-file AES keys, then each encrypted upload as the browser sent it → `dispatched`. The Processing TEE decrypts and checks each file against its commitment; a refusal it would repeat fails the job.
 4. Processing TEE runs the eval, submits results to the leaderboard, then POSTs its terminal status here → `complete` or `error` (with the classified failure)
 5. If the TEE dies without calling back: after `DISPATCH_TIMEOUT_SECONDS` with the TEE unhealthy the job is requeued, at most `MAX_REQUEUE` times, then marked `error` — nothing can loop forever.
 
@@ -88,10 +89,10 @@ Every buffer redeploy changes the digest the browser pins — update `EXPECTED_I
 
 ## Debug
 
-All state persists under `/app/cvm_workflow/buffer/` (same layout as the former Python manager — a rollback reads the same files):
+All state persists under `/app/cvm_workflow/buffer/`:
 - `jobs/<job_id>/job.json` — job record
+- `jobs/<job_id>/artifacts/<slot>.enc` — uploads, still encrypted (their keys are in memory only, so a restart means the job must be resubmitted)
 - `queue.json` — ordered queue
-- `outgoing/<job_id>-secure-dispatch.json` — staged dispatch payload
 - `runtime/dispatch_state.json` — last dispatch breadcrumbs
 
 Serial log prefixes: `buffer-tee:` (server), `scheduler:`, `provision:`, `dispatch:`, `server:`.
